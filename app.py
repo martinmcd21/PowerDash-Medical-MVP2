@@ -1,18 +1,23 @@
 """
 PowerDash Medical — Internal Medical Affairs AI Workbench (MVP)
 ----------------------------------------------------------------
-Core principles:
-- Stateless: no persistence beyond the session (no DB, no file storage of user content)
-- No authentication, no analytics
-- Streamlit-only UI (no JS injection, no st.components, no private Streamlit APIs)
-- ABPI Code–compliant drafting enforced across the suite (feature, not disclaimer)
+Single Streamlit app implementing a multi-tool suite with:
+- Shared layout + shared LLM generation engine
+- Stateless (no DB, no file storage of user content)
+- No auth, no analytics
+- Streamlit-native UI only (no JS injection, no st.components, no private Streamlit APIs)
+- ABPI Code–compliant drafting enforced as a core product feature (not a disclaimer)
 - Drafting support only; medical/legal/regulatory review required
-- References: ONLY from user-provided material
+- References MUST come only from user-provided material
+
+Tile navigation fix:
+- Tiles mutate st.session_state.active_page directly and st.rerun() immediately.
+- Sidebar and tiles share a single authoritative navigation state.
 
 Tech:
 - Python 3.10+
 - Streamlit
-- OpenAI API via OPENAI_API_KEY env var (OpenAI Responses API)
+- OpenAI API via OPENAI_API_KEY env var (OpenAI Python SDK / Responses API)
 - Optional PDF export via reportlab (in-memory only)
 """
 
@@ -21,7 +26,6 @@ from __future__ import annotations
 import os
 import re
 import json
-import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
@@ -38,20 +42,20 @@ try:
 except Exception:
     PDF_AVAILABLE = False
 
-# OpenAI official SDK (Responses API)
-# Docs: https://platform.openai.com/docs/overview?lang=python
-# Structured Outputs: https://platform.openai.com/docs/guides/structured-outputs
+# OpenAI SDK (Responses API)
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None  # handled gracefully
 
 
-# -----------------------------
-# UI CONSTANTS / BRANDING
-# -----------------------------
+# ============================================================
+# APP CONSTANTS / BRANDING
+# ============================================================
+
 APP_TITLE = "PowerDash Medical"
 PRIMARY_BLUE = "#2563eb"
+DEFAULT_MODEL = "gpt-5.2"
 
 PERSISTENT_BADGES = [
     "✅ ABPI Code Compliant",
@@ -60,14 +64,17 @@ PERSISTENT_BADGES = [
     "🛡️ No data retention",
 ]
 
-DEFAULT_MODEL = "gpt-5.2"
+DRAFT_ONLY_BANNER_TEXT = (
+    "ABPI Code Compliant • Medical Affairs Drafting Support Only • "
+    "Medical review required • No data retention"
+)
 
+# ============================================================
+# ABPI COMPLIANCE INJECTION (MANDATORY)
+# ============================================================
 
-# -----------------------------
-# ABPI COMPLIANCE INJECTION
-# -----------------------------
 ABPI_GLOBAL_RULES = """
-You are an internal Medical Affairs drafting assistant for UK & Ireland.
+You are an internal Medical Affairs drafting assistant for the UK & Ireland.
 ABPI Code compliance is mandatory and must be actively enforced in your output.
 
 NON-NEGOTIABLE RULES (apply to ALL outputs):
@@ -82,21 +89,18 @@ NON-NEGOTIABLE RULES (apply to ALL outputs):
 - Output is a DRAFT only and requires medical/legal/regulatory review before use.
 - If evidence is insufficient, explicitly say so and suggest what evidence is needed (without fabricating).
 
-SAFETY / COMPLIANCE RESPONSE STYLE:
+STYLE:
 - Conservative UK/I Medical Affairs tone.
 - Use neutral phrasing (e.g., "may", "is associated with", "evidence suggests") where appropriate.
 - Prefer structured, review-friendly writing.
-"""
-
-DRAFT_ONLY_BANNER_TEXT = (
-    "ABPI Code Compliant • Medical Affairs Drafting Support Only • Medical review required • No data retention"
-)
+""".strip()
 
 
-# -----------------------------
-# GLOBAL SAFETY (KEYWORD + PII)
-# -----------------------------
-# Requirement: Phone number detection must be removed entirely -> we do NOT detect phone numbers.
+# ============================================================
+# GLOBAL SAFETY (MANDATORY)
+# - Simple keyword-based detection for AE/PV and patient-identifiable data
+# - Phone number detection must be removed entirely (DO NOT implement)
+# ============================================================
 
 AE_KEYWORDS = [
     "adverse event", "adverse reaction", "side effect", "suspected adverse", "aer",
@@ -104,10 +108,9 @@ AE_KEYWORDS = [
     "medwatch", "yellow card", "icsr", "fatal", "hospitalisation", "hospitalization"
 ]
 
-# Patient-identifiable patterns (simple heuristics; conservative)
 EMAIL_REGEX = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 
-# NHS number: 10 digits, often spaced (e.g., 943 476 5919). We detect 10 digits optionally spaced.
+# NHS number: 10 digits possibly spaced (e.g., 943 476 5919)
 NHS_REGEX = re.compile(r"\b(\d\s*){10}\b")
 
 # DOB patterns: dd/mm/yyyy, dd-mm-yyyy, yyyy-mm-dd
@@ -115,7 +118,7 @@ DOB_REGEX = re.compile(
     r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})\b"
 )
 
-# "Patient name" heuristic: explicit field labels only (we do NOT attempt general name detection)
+# Conservative patient name label heuristic (do NOT attempt general name detection)
 PATIENT_NAME_LABEL_REGEX = re.compile(
     r"\b(patient\s*name|name\s*of\s*patient|patient:\s*[A-Z])", re.IGNORECASE
 )
@@ -123,9 +126,9 @@ PATIENT_NAME_LABEL_REGEX = re.compile(
 
 def detect_safety_issues(text: str) -> Dict[str, Any]:
     """
-    Returns dict with flags and matched evidence. Conservative; blocks on:
+    Returns dict with flags and evidence. Blocks on:
     - AE / PV triggers
-    - Explicit patient-identifiable data triggers (NHS number, email, DOB, explicit "patient name" labels)
+    - Patient-identifiable patterns (NHS number, email, DOB, explicit patient name label)
     """
     if not text:
         return {"blocked": False, "reasons": [], "matches": {}}
@@ -133,12 +136,12 @@ def detect_safety_issues(text: str) -> Dict[str, Any]:
     lower = text.lower()
 
     ae_hits = [kw for kw in AE_KEYWORDS if kw in lower]
-    email_hits = EMAIL_REGEX.findall(text)
+    email_hits = list(set(EMAIL_REGEX.findall(text)))
     nhs_hit = bool(NHS_REGEX.search(text))
     dob_hit = bool(DOB_REGEX.search(text))
     patient_name_hit = bool(PATIENT_NAME_LABEL_REGEX.search(text))
 
-    reasons = []
+    reasons: List[str] = []
     matches: Dict[str, Any] = {}
 
     if ae_hits:
@@ -147,7 +150,7 @@ def detect_safety_issues(text: str) -> Dict[str, Any]:
 
     if email_hits:
         reasons.append("Potential patient-identifiable data detected (email address).")
-        matches["emails"] = list(set(email_hits))[:5]
+        matches["emails"] = email_hits[:5]
 
     if nhs_hit:
         reasons.append("Potential patient-identifiable data detected (NHS number pattern).")
@@ -161,13 +164,12 @@ def detect_safety_issues(text: str) -> Dict[str, Any]:
         reasons.append("Potential patient-identifiable data detected (explicit patient name label).")
         matches["patient_name_label"] = True
 
-    blocked = len(reasons) > 0
-    return {"blocked": blocked, "reasons": reasons, "matches": matches}
+    return {"blocked": len(reasons) > 0, "reasons": reasons, "matches": matches}
 
 
 def render_blocked(block: Dict[str, Any]) -> None:
     """
-    Centralised safety blocking renderer (required).
+    Centralised safety blocking renderer (mandatory).
     """
     st.error("Generation blocked for safety/compliance reasons.", icon="⛔")
     for r in block.get("reasons", []):
@@ -181,33 +183,27 @@ def render_blocked(block: Dict[str, Any]) -> None:
         icon="ℹ️",
     )
 
-    # Optional: show matched hints (do not echo sensitive strings beyond minimal)
     matches = block.get("matches", {})
     if matches:
         with st.expander("What was detected (high-level)", expanded=False):
             st.json(matches)
 
 
-# -----------------------------
-# OPENAI JSON OUTPUT HANDLING
-# -----------------------------
+# ============================================================
+# JSON OUTPUT HANDLING (MANDATORY)
+# - JSON-only responses enforced
+# - Robust parsing fallback
+# ============================================================
+
 def _extract_first_json_object(text: str) -> Optional[str]:
-    """
-    Fallback extraction: finds the first top-level JSON object in text.
-    """
     if not text:
         return None
-
-    # quick path
     text = text.strip()
     if text.startswith("{") and text.endswith("}"):
         return text
-
-    # brace matching
     start = text.find("{")
     if start == -1:
         return None
-
     depth = 0
     for i in range(start, len(text)):
         ch = text[i]
@@ -216,21 +212,13 @@ def _extract_first_json_object(text: str) -> Optional[str]:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                candidate = text[start:i + 1]
-                return candidate
+                return text[start:i + 1]
     return None
 
 
 def robust_json_loads(raw: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Robust JSON parsing fallback:
-    - Try direct json.loads
-    - If fails, extract first {...} and parse
-    Returns (parsed, parse_note)
-    """
     if not raw:
         return None, "Empty model output."
-
     try:
         return json.loads(raw), "Parsed as full JSON."
     except Exception:
@@ -243,13 +231,15 @@ def robust_json_loads(raw: str) -> Tuple[Optional[Dict[str, Any]], str]:
         return None, "No JSON object found in output."
 
 
-# -----------------------------
-# SHARED GENERATION ENGINE
-# -----------------------------
+# ============================================================
+# OPENAI CLIENT + SHARED GENERATION ENGINE (MANDATORY)
+# - One shared generation function
+# - Model selectable at runtime
+# - ABPI instructions injected into every system prompt
+# - JSON schema enforced (Structured Outputs) with fallback
+# ============================================================
+
 def get_openai_client() -> Optional[Any]:
-    """
-    Creates OpenAI client from environment variable OPENAI_API_KEY.
-    """
     if OpenAI is None:
         return None
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -258,10 +248,7 @@ def get_openai_client() -> Optional[Any]:
     return OpenAI()
 
 
-def make_json_schema_response_format(name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Responses API 'text.format' json_schema format object (strict).
-    """
+def make_json_schema_format(name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "type": "json_schema",
         "name": name,
@@ -281,11 +268,10 @@ def generate_json(
     max_output_tokens: int = 1800,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     """
-    Shared generation function:
-    - Injects ABPI rules into every tool system prompt
-    - Enforces JSON-only via Structured Outputs (json_schema) when supported
-    - Robust fallback parsing if output deviates
-    Returns: (parsed_json_or_none, meta)
+    Shared generation:
+    - ABPI rules injected into every tool
+    - Structured Outputs json_schema when available
+    - Fallback to json_object with schema embedded in instructions
     """
     client = get_openai_client()
     if client is None:
@@ -296,18 +282,16 @@ def generate_json(
             "parse_note": "",
         }
 
-    # Assemble instructions: ABPI + tool-specific
     instructions = (
-        ABPI_GLOBAL_RULES.strip()
+        ABPI_GLOBAL_RULES
         + "\n\n"
         + f"TOOL CONTEXT: {tool_name}\n"
         + system_prompt.strip()
         + "\n\n"
         + "You MUST output JSON only and MUST follow the provided JSON Schema exactly.\n"
-        + "Do not include markdown fences, commentary, or extra keys.\n"
+        + "Do not include markdown, commentary, code fences, or extra keys.\n"
     )
 
-    # User input: strictly structured
     input_items = [
         {
             "role": "user",
@@ -319,8 +303,6 @@ def generate_json(
         }
     ]
 
-    # Try Structured Outputs (json_schema). Per OpenAI docs, supported in Responses API via text.format.
-    # If the model rejects the format, we retry with json_object and stricter instructions.
     raw_text = ""
     parse_note = ""
     try:
@@ -330,7 +312,7 @@ def generate_json(
             input=input_items,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
-            text={"format": make_json_schema_response_format(f"{tool_name}_schema", json_schema)},
+            text={"format": make_json_schema_format(f"{tool_name}_schema", json_schema)},
         )
         raw_text = getattr(resp, "output_text", "") or ""
         parsed, parse_note = robust_json_loads(raw_text)
@@ -338,7 +320,7 @@ def generate_json(
             return parsed, {"ok": True, "raw": raw_text, "parse_note": parse_note}
         return None, {"ok": False, "raw": raw_text, "parse_note": parse_note, "error": "Model output was not valid JSON."}
     except Exception as e:
-        # Fallback: JSON mode (json_object) + schema embedded in instructions
+        # Fallback: JSON mode with schema embedded
         try:
             fallback_instructions = instructions + "\n\nJSON SCHEMA (must match):\n" + json.dumps(json_schema, indent=2)
             resp = client.responses.create(
@@ -372,13 +354,14 @@ def generate_json(
             }
 
 
-# -----------------------------
-# EXPORT HELPERS (TXT / PDF)
-# -----------------------------
+# ============================================================
+# EXPORT HELPERS (MANDATORY)
+# - Copy via st.code()
+# - Download .txt
+# - Optional PDF download (reportlab)
+# ============================================================
+
 def as_pretty_text(obj: Dict[str, Any]) -> str:
-    """
-    Display/export helper: stable, review-friendly formatting.
-    """
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
@@ -393,36 +376,28 @@ def make_txt_download(label: str, text: str, filename: str) -> None:
 
 
 def make_pdf_bytes(title: str, text: str) -> Optional[bytes]:
-    """
-    In-memory PDF generation (no file storage).
-    """
     if not PDF_AVAILABLE:
         return None
-
     from io import BytesIO
-
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
-    # Simple header
     c.setTitle(title)
     c.setFont("Helvetica-Bold", 12)
     c.drawString(20 * mm, height - 20 * mm, title)
     c.setFont("Helvetica", 9)
     c.drawString(20 * mm, height - 27 * mm, DRAFT_ONLY_BANNER_TEXT)
 
-    # Body (naive line wrap)
     c.setFont("Helvetica", 9)
     x = 20 * mm
     y = height - 35 * mm
-    max_width = width - 40 * mm
     line_height = 4.5 * mm
 
     def wrap_line(line: str, max_chars: int = 110) -> List[str]:
         if len(line) <= max_chars:
             return [line]
-        chunks = []
+        chunks: List[str] = []
         current = ""
         for word in line.split(" "):
             if len(current) + len(word) + 1 <= max_chars:
@@ -464,24 +439,22 @@ def make_pdf_download(label: str, title: str, text: str, filename: str) -> None:
         )
 
 
-# -----------------------------
-# TOOL DEFINITIONS (PROMPTS + SCHEMAS)
-# -----------------------------
+# ============================================================
+# TOOL DEFINITIONS (PROMPTS + JSON SCHEMAS)
+# ============================================================
+
 @dataclass(frozen=True)
 class ToolSpec:
     key: str
     name: str
     emoji: str
-    category: str  # "Core Medical Affairs Tools" | "Additional Tools"
+    category: str
     description: str
     system_prompt: str
     schema: Dict[str, Any]
 
 
 def schema_base() -> Dict[str, Any]:
-    """
-    Shared schema fragments via composition (simple dict merges in place).
-    """
     return {
         "type": "object",
         "additionalProperties": False,
@@ -493,17 +466,10 @@ def schema_base() -> Dict[str, Any]:
                 "required": ["status", "checks"],
                 "properties": {
                     "status": {"type": "string", "enum": ["compliant_draft"]},
-                    "checks": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 3,
-                    },
+                    "checks": {"type": "array", "items": {"type": "string"}, "minItems": 3},
                 },
             },
-            "draft_notice": {
-                "type": "string",
-                "description": "Short fixed notice that this is drafting support only and requires review.",
-            },
+            "draft_notice": {"type": "string"},
         },
     }
 
@@ -523,11 +489,15 @@ Requirements:
 - Use ONLY the provided publications/positioning notes.
 - Avoid promotional tone; no calls to action; no superiority/comparative claims.
 - Present balanced disease and science overview; include uncertainties and limitations.
-- If the provided evidence is thin, clearly state gaps and what would be needed.
+- If evidence is thin, clearly state gaps and what would be needed.
 """.strip(),
     schema={
         **schema_base(),
-        "required": ["abpi_compliance", "draft_notice", "core_scientific_narrative", "disease_state_overview", "short_form_variants", "references_used"],
+        "required": [
+            "abpi_compliance", "draft_notice",
+            "core_scientific_narrative", "disease_state_overview",
+            "short_form_variants", "references_used"
+        ],
         "properties": {
             **schema_base()["properties"],
             "core_scientific_narrative": {"type": "string"},
@@ -542,11 +512,7 @@ Requirements:
                     "congress_discussions": {"type": "string"},
                 },
             },
-            "references_used": {
-                "type": "array",
-                "description": "List ONLY citations explicitly present in the user-provided text, quoted/identified succinctly.",
-                "items": {"type": "string"},
-            },
+            "references_used": {"type": "array", "items": {"type": "string"}},
         },
         "additionalProperties": False,
         "type": "object",
@@ -570,8 +536,12 @@ Requirements:
 """.strip(),
     schema={
         **schema_base(),
-        "required": ["abpi_compliance", "draft_notice", "objectives", "key_scientific_messages", "stakeholder_hypotheses",
-                    "discussion_guide", "anticipated_qa", "do_dont_guidance", "follow_up_actions", "references_used"],
+        "required": [
+            "abpi_compliance", "draft_notice",
+            "objectives", "key_scientific_messages", "stakeholder_hypotheses",
+            "discussion_guide", "anticipated_qa", "do_dont_guidance",
+            "follow_up_actions", "references_used"
+        ],
         "properties": {
             **schema_base()["properties"],
             "objectives": {"type": "array", "items": {"type": "string"}},
@@ -584,19 +554,18 @@ Requirements:
                     "type": "object",
                     "additionalProperties": False,
                     "required": ["question", "answer"],
-                    "properties": {
-                        "question": {"type": "string"},
-                        "answer": {"type": "string"},
-                    },
+                    "properties": {"question": {"type": "string"}, "answer": {"type": "string"}},
                 },
             },
-            "do_dont_guidance": {"type": "object",
-                                "additionalProperties": False,
-                                "required": ["do", "dont"],
-                                "properties": {
-                                    "do": {"type": "array", "items": {"type": "string"}},
-                                    "dont": {"type": "array", "items": {"type": "string"}},
-                                }},
+            "do_dont_guidance": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["do", "dont"],
+                "properties": {
+                    "do": {"type": "array", "items": {"type": "string"}},
+                    "dont": {"type": "array", "items": {"type": "string"}},
+                },
+            },
             "follow_up_actions": {"type": "array", "items": {"type": "string"}},
             "references_used": {"type": "array", "items": {"type": "string"}},
         },
@@ -625,7 +594,11 @@ Requirements:
 """.strip(),
     schema={
         **schema_base(),
-        "required": ["abpi_compliance", "draft_notice", "long_form_response", "short_verbal_response", "references_used", "limitations"],
+        "required": [
+            "abpi_compliance", "draft_notice",
+            "long_form_response", "short_verbal_response",
+            "references_used", "limitations"
+        ],
         "properties": {
             **schema_base()["properties"],
             "long_form_response": {"type": "string"},
@@ -750,7 +723,7 @@ Requirements:
     },
 )
 
-# 7) Compliance & Governance Summary (static)
+# 7) Compliance & Governance Summary (static page)
 TOOLS["compliance_governance"] = ToolSpec(
     key="compliance_governance",
     name="Compliance & Governance Summary",
@@ -791,24 +764,20 @@ Requirements:
 )
 
 
-# -----------------------------
-# STREAMLIT APP SHELL / STYLES
-# -----------------------------
+# ============================================================
+# STREAMLIT UI HELPERS (STREAMLIT-SAFE)
+# ============================================================
+
 def inject_css() -> None:
-    """
-    Streamlit-stable CSS injection (no JS, no overlays, no click interception).
-    Styles tool tiles and sidebar badges.
-    """
     st.markdown(
         f"""
 <style>
-/* Wider layout */
 .block-container {{
   padding-top: 1.2rem;
   padding-bottom: 2rem;
 }}
 
-/* Tile button style: we style the Streamlit button itself */
+/* Tile buttons */
 div.stButton > button {{
   background: {PRIMARY_BLUE};
   color: white;
@@ -819,14 +788,9 @@ div.stButton > button {{
   text-align: left;
   font-weight: 700;
 }}
-div.stButton > button:hover {{
-  filter: brightness(0.95);
-}}
-div.stButton > button:active {{
-  filter: brightness(0.9);
-}}
+div.stButton > button:hover {{ filter: brightness(0.95); }}
+div.stButton > button:active {{ filter: brightness(0.9); }}
 
-/* Small caption-like muted text */
 .pdm-muted {{
   color: rgba(255,255,255,0.9);
   font-weight: 500;
@@ -844,63 +808,9 @@ div.stButton > button:active {{
   font-size: 0.8rem;
 }}
 </style>
-        """,
+""",
         unsafe_allow_html=True,
     )
-
-
-def sidebar_persistent_ui(selected_model: str) -> str:
-    st.sidebar.title(APP_TITLE)
-
-    st.sidebar.markdown("### Status")
-    for b in PERSISTENT_BADGES:
-        st.sidebar.markdown(f"<span class='pdm-badge'>{b}</span>", unsafe_allow_html=True)
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### Model")
-    model = st.sidebar.text_input(
-        "OpenAI model (runtime)",
-        value=selected_model,
-        help="Change the OpenAI model at runtime. Default is gpt-5.2.",
-    )
-    st.sidebar.caption(f"Current model in use: **{model}**")
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### Navigation")
-    return model
-
-
-def tool_nav() -> str:
-    """
-    Sidebar navigation (mirrors PowerDash HR layout):
-    - Home
-    - Core Medical Affairs Tools
-    - Additional Tools
-    """
-    options = [
-        ("home", "🏠 Home"),
-        ("core_header", "— Core Medical Affairs Tools —"),
-        ("scientific_narrative", "📄 Scientific Narrative Generator"),
-        ("msl_briefing_pack", "🧠 MSL Briefing Pack Generator"),
-        ("med_info_response", "📚 Medical Information Response Generator"),
-        ("congress_adboard_planner", "🎤 Congress & Advisory Board Planner"),
-        ("additional_header", "— Additional Tools —"),
-        ("insight_thematic_analysis", "📊 Insight Capture & Thematic Analysis"),
-        ("exec_summary", "📈 Medical Affairs Executive Summary Generator"),
-        ("sop_drafting", "📑 Medical Affairs SOP Drafting Tool"),
-        ("compliance_governance", "🔒 Compliance & Governance Summary"),
-    ]
-
-    labels = [label for _, label in options]
-    keys = [key for key, _ in options]
-
-    choice_label = st.sidebar.radio("Go to", labels, index=0)
-    choice_key = keys[labels.index(choice_label)]
-
-    # headers route to home
-    if choice_key in ("core_header", "additional_header"):
-        return "home"
-    return choice_key
 
 
 def render_header() -> None:
@@ -911,63 +821,104 @@ def render_header() -> None:
     )
 
 
-# -----------------------------
-# HOME PAGE (TOOL TILES)
-# -----------------------------
-def render_home(tool_choice_key: Optional[str] = None) -> Optional[str]:
+def sidebar_persistent_ui() -> None:
+    st.sidebar.title(APP_TITLE)
+    st.sidebar.markdown("### Status")
+    for b in PERSISTENT_BADGES:
+        st.sidebar.markdown(f"<span class='pdm-badge'>{b}</span>", unsafe_allow_html=True)
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Model")
+    st.session_state.selected_model = st.sidebar.text_input(
+        "OpenAI model (runtime)",
+        value=st.session_state.selected_model,
+        help="Change the OpenAI model at runtime. Default is gpt-5.2.",
+    )
+    st.sidebar.caption(f"Current model in use: **{st.session_state.selected_model}**")
+
+    st.sidebar.markdown("---")
+
+
+def sidebar_nav() -> str:
+    """
+    Sidebar navigation (mirrors PowerDash HR layout)
+    """
+    labels = [
+        "🏠 Home",
+        "— Core Medical Affairs Tools —",
+        "📄 Scientific Narrative Generator",
+        "🧠 MSL Briefing Pack Generator",
+        "📚 Medical Information Response Generator",
+        "🎤 Congress & Advisory Board Planner",
+        "— Additional Tools —",
+        "📊 Insight Capture & Thematic Analysis",
+        "📈 Medical Affairs Executive Summary Generator",
+        "📑 Medical Affairs SOP Drafting Tool",
+        "🔒 Compliance & Governance Summary",
+    ]
+    choice = st.sidebar.radio("Go to", labels, index=0)
+
+    mapping = {
+        "🏠 Home": "home",
+        "📄 Scientific Narrative Generator": "scientific_narrative",
+        "🧠 MSL Briefing Pack Generator": "msl_briefing_pack",
+        "📚 Medical Information Response Generator": "med_info_response",
+        "🎤 Congress & Advisory Board Planner": "congress_adboard_planner",
+        "📊 Insight Capture & Thematic Analysis": "insight_thematic_analysis",
+        "📈 Medical Affairs Executive Summary Generator": "exec_summary",
+        "📑 Medical Affairs SOP Drafting Tool": "sop_drafting",
+        "🔒 Compliance & Governance Summary": "compliance_governance",
+        "— Core Medical Affairs Tools —": "home",
+        "— Additional Tools —": "home",
+    }
+    return mapping.get(choice, "home")
+
+
+# ============================================================
+# HOME PAGE (TILES) — FIXED CLICK HANDLING
+# ============================================================
+
+def render_home() -> None:
     st.title(APP_TITLE)
     render_header()
 
     st.markdown("### Tool Suite")
     st.write("Select a tool using the sidebar, or click a tile below.")
 
-    # Tile grid
-    core = [t for t in TOOLS.values() if t.category == "Core Medical Affairs Tools" and t.key != "compliance_governance"]
+    core = [t for t in TOOLS.values() if t.category == "Core Medical Affairs Tools"]
     additional = [t for t in TOOLS.values() if t.category == "Additional Tools"]
 
-    def tile(tool: ToolSpec) -> Optional[str]:
-        label = f"{tool.emoji} {tool.name}"
-        if st.button(label, key=f"tile_{tool.key}", use_container_width=True):
-            return tool.key
+    def tile(tool: ToolSpec) -> None:
+        if st.button(f"{tool.emoji} {tool.name}", key=f"tile_{tool.key}", use_container_width=True):
+            # FIX: mutate state directly, then rerun
+            st.session_state.active_page = tool.key
+            st.rerun()
+
         st.markdown(f"<div class='pdm-muted'>{tool.description}</div>", unsafe_allow_html=True)
-        st.write("")  # spacing
-        return None
+        st.write("")
 
     st.subheader("Core Medical Affairs Tools")
     c1, c2 = st.columns(2)
-    picked = None
     for i, tool in enumerate(core):
         with (c1 if i % 2 == 0 else c2):
-            res = tile(tool)
-            if res:
-                picked = res
+            tile(tool)
 
     st.subheader("Additional Tools")
     a1, a2 = st.columns(2)
     for i, tool in enumerate(additional):
         with (a1 if i % 2 == 0 else a2):
-            res = tile(tool)
-            if res:
-                picked = res
-
-    return picked
+            tile(tool)
 
 
-# -----------------------------
-# TOOL UIs
-# -----------------------------
+# ============================================================
+# GENERATION FLOW + EXPORT UI
+# ============================================================
+
 def export_section(tool_key: str, title: str, parsed: Dict[str, Any]) -> None:
-    """
-    Export/copy section (Streamlit-native):
-    - st.code() provides built-in copy button
-    - Download .txt
-    - Optional PDF download (reportlab)
-    """
     st.markdown("### Output (JSON draft)")
     pretty = as_pretty_text(parsed)
-    st.code(pretty, language="json")
+    st.code(pretty, language="json")  # built-in copy button
 
-    # filenames are randomised and session-only; no content is stored server-side by this code
     suffix = uuid.uuid4().hex[:8]
     txt_name = f"{tool_key}_{suffix}.txt"
     pdf_name = f"{tool_key}_{suffix}.pdf"
@@ -979,19 +930,8 @@ def export_section(tool_key: str, title: str, parsed: Dict[str, Any]) -> None:
         make_pdf_download("⬇️ Download PDF", title, pretty, pdf_name)
 
 
-def run_generation_flow(
-    *,
-    model: str,
-    tool: ToolSpec,
-    user_payload: Dict[str, Any],
-) -> None:
-    """
-    Executes:
-    - Safety scan (AE/PII)
-    - Generation call
-    - Displays output + export
-    """
-    # Global safety scan on the full concatenated payload text
+def run_generation_flow(*, model: str, tool: ToolSpec, user_payload: Dict[str, Any]) -> None:
+    # Safety scan over full payload
     concat_text = json.dumps(user_payload, ensure_ascii=False)
     block = detect_safety_issues(concat_text)
     if block["blocked"]:
@@ -1020,6 +960,10 @@ def run_generation_flow(
     export_section(tool.key, f"{APP_TITLE} — {tool.name}", parsed)
 
 
+# ============================================================
+# TOOL PAGES
+# ============================================================
+
 def tool_scientific_narrative(model: str) -> None:
     tool = TOOLS["scientific_narrative"]
     st.header(f"{tool.emoji} {tool.name}")
@@ -1030,8 +974,8 @@ def tool_scientific_narrative(model: str) -> None:
         product = st.text_input("Product / Molecule")
         indication = st.text_input("Indication")
         moa = st.text_area("Mechanism of Action", height=120)
-        pubs = st.text_area("Key publications (paste text / citations)", height=180)
-        positioning = st.text_area("Internal positioning notes (non-promotional)", height=180)
+        pubs = st.text_area("Key publications (user pasted)", height=180)
+        positioning = st.text_area("Internal positioning notes", height=180)
         submitted = st.form_submit_button("Generate draft", use_container_width=True)
 
     if submitted:
@@ -1056,9 +1000,9 @@ def tool_msl_briefing_pack(model: str) -> None:
         therapy_area = st.text_input("Therapy area")
         product = st.text_input("Product / Molecule")
         indication = st.text_input("Indication")
-        objectives_context = st.text_area("Context / objectives (what is the scientific exchange purpose?)", height=140)
-        evidence = st.text_area("Evidence / key publications provided by user", height=200)
-        constraints = st.text_area("Internal constraints / boundaries (e.g., on-label scope)", height=120)
+        objectives_context = st.text_area("Context / objectives", height=140)
+        evidence = st.text_area("Evidence provided by user", height=200)
+        constraints = st.text_area("Internal constraints / boundaries", height=120)
         submitted = st.form_submit_button("Generate draft", use_container_width=True)
 
     if submitted:
@@ -1085,10 +1029,10 @@ def tool_med_info_response(model: str) -> None:
     )
 
     with st.form("med_info_response_form"):
-        country = st.selectbox("Country", ["UK", "Ireland"], index=0)
+        country = st.selectbox("Country (UK / Ireland)", ["UK", "Ireland"], index=0)
         audience = st.selectbox("Audience", ["HCP", "Pharmacist", "Payer"], index=0)
-        question = st.text_area("Medical question (no patient case details)", height=140)
-        evidence = st.text_area("Evidence provided by user (paste only approved excerpts/citations)", height=220)
+        question = st.text_area("Medical question", height=140)
+        evidence = st.text_area("Evidence provided by user (paste)", height=220)
         submitted = st.form_submit_button("Generate draft", use_container_width=True)
 
     if submitted:
@@ -1109,8 +1053,8 @@ def tool_congress_adboard_planner(model: str) -> None:
     with st.form("congress_adboard_planner_form"):
         meeting_type = st.selectbox("Type", ["Congress activity", "Advisory Board", "Hybrid"], index=0)
         goals = st.text_area("Objectives (scientific exchange / insight goals)", height=140)
-        audience = st.text_input("Intended participants (e.g., specialty mix, stakeholder types)")
-        constraints = st.text_area("Constraints (compliance boundaries, topics in/out of scope)", height=140)
+        audience = st.text_input("Intended participants (e.g., stakeholder types)")
+        constraints = st.text_area("Constraints (topics in/out of scope)", height=140)
         context = st.text_area("Scientific context / evidence (user-provided only)", height=220)
         submitted = st.form_submit_button("Generate draft", use_container_width=True)
 
@@ -1130,12 +1074,11 @@ def tool_insight_thematic_analysis(model: str) -> None:
     tool = TOOLS["insight_thematic_analysis"]
     st.header(f"{tool.emoji} {tool.name}")
     render_header()
-
     st.caption("Session-only: nothing is saved beyond the current session/refresh.")
 
     with st.form("insight_thematic_analysis_form"):
         notes = st.text_area("Paste insight notes (de-identified; no patient data)", height=260)
-        framing = st.text_area("Optional framing (therapy area, stakeholder type, meeting context)", height=140)
+        framing = st.text_area("Optional framing (therapy area, stakeholder type, context)", height=140)
         submitted = st.form_submit_button("Analyse insights", use_container_width=True)
 
     if submitted:
@@ -1153,8 +1096,12 @@ def tool_exec_summary(model: str) -> None:
     render_header()
 
     with st.form("exec_summary_form"):
-        source_text = st.text_area("Paste source material (insights, notes, draft outputs — de-identified)", height=260)
-        leader_audience = st.selectbox("Leadership audience", ["UK/I Medical Lead", "Country Medical Director", "Regional/Global MA Leadership"], index=0)
+        source_text = st.text_area("Paste source material (de-identified)", height=260)
+        leader_audience = st.selectbox(
+            "Leadership audience",
+            ["UK/I Medical Lead", "Country Medical Director", "Regional/Global MA Leadership"],
+            index=0,
+        )
         focus = st.text_area("Focus areas (optional)", height=140)
         submitted = st.form_submit_button("Generate executive summary", use_container_width=True)
 
@@ -1175,7 +1122,7 @@ def tool_sop_drafting(model: str) -> None:
 
     with st.form("sop_drafting_form"):
         sop_title = st.text_input("SOP title")
-        purpose = st.text_area("Purpose and scope (what should this SOP cover?)", height=160)
+        purpose = st.text_area("Purpose and scope", height=160)
         process_requirements = st.text_area("Process requirements (steps, approvals, roles, timelines)", height=240)
         governance = st.text_area("Governance requirements (training, documentation, audit readiness)", height=160)
         submitted = st.form_submit_button("Draft SOP", use_container_width=True)
@@ -1238,38 +1185,38 @@ def tool_compliance_governance_static() -> None:
     )
 
 
-# -----------------------------
-# MAIN ROUTER
-# -----------------------------
+# ============================================================
+# MAIN APP (NAVIGATION STATE MACHINE) — FIXED
+# ============================================================
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-
     inject_css()
 
-    # Sidebar: model selector + persistent badges + navigation
-    selected_model = st.session_state.get("selected_model", DEFAULT_MODEL)
-    model = sidebar_persistent_ui(selected_model)
-    st.session_state["selected_model"] = model
+    # Session-state init
+    if "active_page" not in st.session_state:
+        st.session_state.active_page = "home"
+    if "selected_model" not in st.session_state:
+        st.session_state.selected_model = DEFAULT_MODEL
 
-    page = tool_nav()
+    # Sidebar persistent UI + model selection
+    sidebar_persistent_ui()
 
-    # Home tiles (also allow tile click to navigate by setting session state)
-    if page == "home":
-        picked = render_home()
-        if picked:
-            # Navigate to selected tool within the same session
-            st.session_state["nav_to"] = picked
-            st.rerun()
+    # Sidebar navigation writes into shared state (sidebar wins when changed)
+    sidebar_page = sidebar_nav()
+    if sidebar_page != st.session_state.active_page:
+        st.session_state.active_page = sidebar_page
+        st.rerun()
 
-        nav_to = st.session_state.pop("nav_to", None)
-        if nav_to:
-            page = nav_to
-
-    # Show selected model clearly in main area too
+    model = st.session_state.selected_model
     st.caption(f"Model in use: **{model}**")
 
-    # Route
-    if page == "scientific_narrative":
+    page = st.session_state.active_page
+
+    # Router
+    if page == "home":
+        render_home()
+    elif page == "scientific_narrative":
         tool_scientific_narrative(model)
     elif page == "msl_briefing_pack":
         tool_msl_briefing_pack(model)
@@ -1286,7 +1233,8 @@ def main() -> None:
     elif page == "compliance_governance":
         tool_compliance_governance_static()
     else:
-        render_home()
+        st.session_state.active_page = "home"
+        st.rerun()
 
 
 if __name__ == "__main__":

@@ -627,15 +627,21 @@ def sidebar() -> Tuple[str, str]:
     # Navigation
     st.sidebar.subheader("Navigation")
     # Use radio for stable navigation; tiles also available on home
-    page = st.sidebar.radio(
+        # ---- Navigation (FIXED: no reroute on rerun) ----
+    def on_nav_change():
+        st.session_state["page"] = st.session_state["nav_choice"]
+
+    st.sidebar.subheader("Navigation")
+    st.sidebar.radio(
         "Go to",
         options=ALL_PAGES,
-        index=ALL_PAGES.index(get_page()) if get_page() in ALL_PAGES else 0,
+        key="nav_choice",
+        index=ALL_PAGES.index(st.session_state.get("page", TOOL_HOME)),
+        on_change=on_nav_change,
         label_visibility="collapsed",
     )
-    st.session_state["page"] = page
 
-    return page, model
+    return st.session_state.get("page", TOOL_HOME), model    return page, model
 
 
 # -----------------------------
